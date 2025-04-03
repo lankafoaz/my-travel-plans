@@ -1,0 +1,439 @@
+import SwiftUI
+import UIKit // Needed for UIBezierPath, UIRectCorner
+import Foundation // For UUID, Date, Calendar
+import Combine // For @Published
+
+// MARK: - Current Date Comment
+// Code updated as of: 2025-04-03
+
+// MARK: - Coin Management
+class CoinManager: ObservableObject {
+    @Published var coins: Int {
+        didSet { UserDefaults.standard.set(coins, forKey: "userCoins") }
+    }
+    init() {
+        if UserDefaults.standard.object(forKey: "userCoins") == nil { self.coins = 3; UserDefaults.standard.set(self.coins, forKey: "userCoins"); print("CoinManager: Init new with 3 coins.") }
+        else { self.coins = UserDefaults.standard.integer(forKey: "userCoins"); print("CoinManager: Loaded \(self.coins) coins.") }
+    }
+    func addCoin() { self.coins += 1; print("CoinManager: Added coin. Total: \(self.coins)") }
+    func spendCoin() -> Bool { if coins > 0 { self.coins -= 1; print("CoinManager: Spent coin. Total: \(self.coins)"); return true }; print("CoinManager: Spend failed. Total: \(coins)"); return false }
+    // Removed resetCoins()
+}
+
+// MARK: - Helper Extensions & Shapes
+extension View { func cornerRadius(_ radius: CGFloat, corners: UIRectCorner) -> some View { clipShape( RoundedCorners(radius: radius, corners: corners) ) } }
+struct RoundedCorners: Shape { var radius: CGFloat = .infinity; var corners: UIRectCorner = .allCorners; func path(in rect: CGRect) -> Path { let path = UIBezierPath(roundedRect: rect, byRoundingCorners: corners, cornerRadii: CGSize(width: radius, height: radius)); return Path(path.cgPath) } }
+
+// MARK: - Data Models (Unchanged)
+struct ChessPosition: Equatable, Hashable { let row: Int; let col: Int }
+struct ChessMove { let from: ChessPosition; let to: ChessPosition; let piece: ChessPiece; let capturedPiece: ChessPiece?; let promotionType: ChessPieceType?; let wasEnPassant: Bool; let wasCastling: Bool }
+enum ChessColor { case white, black; var opponent: ChessColor { self == .white ? .black : .white } }
+enum ChessPieceType: Int { case pawn = 0, rook, knight, bishop, queen, king }
+struct ChessPiece: Equatable { let color: ChessColor; let type: ChessPieceType; var hasMoved: Bool = false; static func == (lhs: ChessPiece, rhs: ChessPiece) -> Bool { lhs.color == rhs.color && lhs.type == rhs.type } }
+struct Domino: Identifiable, Equatable { let id = UUID(); let topValue: Int; let bottomValue: Int; var sum: Int { topValue + bottomValue }; var isDouble: Bool { topValue == bottomValue }; static func == (lhs: Domino, rhs: Domino) -> Bool { lhs.id == rhs.id } }
+struct PlayedDomino: Identifiable { let id = UUID(); let domino: Domino; let isRotated: Bool }
+struct DominoHint { let dominoId: UUID; let endToPlay: DominoEnd; let message: String }
+enum DominoEnd { case left, right }
+enum PlayerType { case player1, player2 }
+struct Snake: Equatable { let start: Int; let end: Int }
+struct Ladder: Equatable { let start: Int; let end: Int }
+
+// MARK: - View Model Protocol for Coin Count
+protocol CoinCountProvider: ObservableObject {
+    var currentCoinCount: Int { get }
+}
+
+// MARK: - Game Logic Classes (Unchanged)
+class ChessGame { /* ... Full ChessGame implementation ... */
+    var board: [[ChessPiece?]] = Array(repeating: Array(repeating: nil, count: 8), count: 8)
+    var currentPlayer: ChessColor = .white; var moveHistory: [ChessMove] = []
+    var isCheck: Bool = false; var isCheckmate: Bool = false; var isStalemate: Bool = false
+    var isGameOver: Bool { isCheckmate || isStalemate }; var winner: ChessColor? = nil
+    private var whiteKingPosition: ChessPosition?; private var blackKingPosition: ChessPosition?
+    private var whiteCanCastleKingSide: Bool = true; private var whiteCanCastleQueenSide: Bool = true
+    private var blackCanCastleKingSide: Bool = true; private var blackCanCastleQueenSide: Bool = true
+    private var enPassantTargetSquare: ChessPosition?
+    init() { setupBoard() }
+    func setupBoard() { board = Array(repeating: Array(repeating: nil, count: 8), count: 8); moveHistory = []; currentPlayer = .white; isCheck = false; isCheckmate = false; isStalemate = false; winner = nil; whiteCanCastleKingSide = true; whiteCanCastleQueenSide = true; blackCanCastleKingSide = true; blackCanCastleQueenSide = true; enPassantTargetSquare = nil; for col in 0..<8 { board[1][col] = ChessPiece(color: .black, type: .pawn); board[6][col] = ChessPiece(color: .white, type: .pawn) }; board[0][0] = ChessPiece(color: .black, type: .rook); board[0][7] = ChessPiece(color: .black, type: .rook); board[7][0] = ChessPiece(color: .white, type: .rook); board[7][7] = ChessPiece(color: .white, type: .rook); board[0][1] = ChessPiece(color: .black, type: .knight); board[0][6] = ChessPiece(color: .black, type: .knight); board[7][1] = ChessPiece(color: .white, type: .knight); board[7][6] = ChessPiece(color: .white, type: .knight); board[0][2] = ChessPiece(color: .black, type: .bishop); board[0][5] = ChessPiece(color: .black, type: .bishop); board[7][2] = ChessPiece(color: .white, type: .bishop); board[7][5] = ChessPiece(color: .white, type: .bishop); board[0][3] = ChessPiece(color: .black, type: .queen); board[7][3] = ChessPiece(color: .white, type: .queen); board[0][4] = ChessPiece(color: .black, type: .king); board[7][4] = ChessPiece(color: .white, type: .king); whiteKingPosition = ChessPosition(row: 7, col: 4); blackKingPosition = ChessPosition(row: 0, col: 4); updateGameState() }
+    private func isPseudoLegalMove(from: ChessPosition, to: ChessPosition, for player: ChessColor) -> Bool { guard isValidPosition(from) && isValidPosition(to) else { return false }; guard let piece = board[from.row][from.col], piece.color == player else { return false }; if let targetPiece = board[to.row][to.col], targetPiece.color == player { return false }; switch piece.type { case .pawn: return isValidPawnMove(from: from, to: to, piece: piece); case .rook: return isValidStraightMove(from: from, to: to); case .knight: return isValidKnightMove(from: from, to: to); case .bishop: return isValidDiagonalMove(from: from, to: to); case .queen: return isValidStraightMove(from: from, to: to) || isValidDiagonalMove(from: from, to: to); case .king: return isValidKingMove(from: from, to: to, piece: piece) } }
+    func isValidMove(from: ChessPosition, to: ChessPosition) -> Bool { if !isPseudoLegalMove(from: from, to: to, for: currentPlayer) { return false }; guard let piece = board[from.row][from.col] else { return false }; let captured = board[to.row][to.col]; let originalEnPassant = enPassantTargetSquare; let originalKingPos = currentPlayer == .white ? whiteKingPosition : blackKingPosition; let originalHasMoved = piece.hasMoved; let castlingRightsBefore = (whiteCanCastleKingSide, whiteCanCastleQueenSide, blackCanCastleKingSide, blackCanCastleQueenSide); var simulatedPiece = piece; var capturedEnPassantPawnPos: ChessPosition? = nil; var capturedEnPassantPawn: ChessPiece? = nil; let isCastlingSim = simulatedPiece.type == .king && abs(from.col - to.col) == 2; let isEnPassantSim = simulatedPiece.type == .pawn && to == enPassantTargetSquare; let promotionRankSim = (simulatedPiece.color == .white) ? 0 : 7; let isPromotionSim = simulatedPiece.type == .pawn && to.row == promotionRankSim; if isCastlingSim { let kingSide = to.col > from.col; let rookCol = kingSide ? 7 : 0; let rookDestCol = kingSide ? 5 : 3; if let rook = board[from.row][rookCol] { board[from.row][rookDestCol] = rook; board[from.row][rookCol] = nil } } else if isEnPassantSim { let capturedPawnRow = currentPlayer == .white ? to.row + 1 : to.row - 1; capturedEnPassantPawnPos = ChessPosition(row: capturedPawnRow, col: to.col); capturedEnPassantPawn = board[capturedEnPassantPawnPos!.row][capturedEnPassantPawnPos!.col]; board[capturedEnPassantPawnPos!.row][capturedEnPassantPawnPos!.col] = nil } else if isPromotionSim { simulatedPiece = ChessPiece(color: simulatedPiece.color, type: .queen, hasMoved: true) }; simulatedPiece.hasMoved = true; board[to.row][to.col] = simulatedPiece; board[from.row][from.col] = nil; if simulatedPiece.type == .king { if currentPlayer == .white { whiteKingPosition = to } else { blackKingPosition = to } }; let kingInCheckAfterMove = isKingInCheck(color: currentPlayer); board[from.row][from.col] = piece; board[from.row][from.col]?.hasMoved = originalHasMoved; board[to.row][to.col] = captured; if isCastlingSim { let kingSide = to.col > from.col; let rookCol = kingSide ? 7 : 0; let rookDestCol = kingSide ? 5 : 3; if let rook = board[from.row][rookDestCol] { board[from.row][rookCol] = rook; board[from.row][rookDestCol] = nil } } else if isEnPassantSim, let epPawnPos = capturedEnPassantPawnPos { board[epPawnPos.row][epPawnPos.col] = capturedEnPassantPawn }; if piece.type == .king { if currentPlayer == .white { whiteKingPosition = originalKingPos } else { blackKingPosition = originalKingPos } }; enPassantTargetSquare = originalEnPassant; (whiteCanCastleKingSide, whiteCanCastleQueenSide, blackCanCastleKingSide, blackCanCastleQueenSide) = castlingRightsBefore; return !kingInCheckAfterMove }
+    private func isValidPawnMove(from: ChessPosition, to: ChessPosition, piece: ChessPiece) -> Bool { let direction = piece.color == .white ? -1 : 1; let startRow = piece.color == .white ? 6 : 1; let rowDiff = to.row - from.row; let colDiff = to.col - from.col; if colDiff == 0 && rowDiff == direction && board[to.row][to.col] == nil { return true }; if colDiff == 0 && rowDiff == 2 * direction && from.row == startRow && board[to.row][to.col] == nil && board[from.row + direction][from.col] == nil { return true }; if abs(colDiff) == 1 && rowDiff == direction { if let targetPiece = board[to.row][to.col], targetPiece.color != piece.color { return true }; if to == enPassantTargetSquare { let capturedPawnRow = piece.color == .white ? to.row + 1 : to.row - 1; if let passedPawn = board[capturedPawnRow][to.col], passedPawn.type == .pawn, passedPawn.color != piece.color { return true } } }; return false }
+    private func isValidStraightMove(from: ChessPosition, to: ChessPosition) -> Bool { guard from.row == to.row || from.col == to.col else { return false }; return isPathClear(from: from, to: to) }
+    private func isValidDiagonalMove(from: ChessPosition, to: ChessPosition) -> Bool { guard abs(from.row - to.row) == abs(from.col - to.col) else { return false }; return isPathClear(from: from, to: to) }
+    private func isValidKnightMove(from: ChessPosition, to: ChessPosition) -> Bool { let rowDiff = abs(from.row - to.row); let colDiff = abs(from.col - to.col); return (rowDiff == 2 && colDiff == 1) || (rowDiff == 1 && colDiff == 2) }
+    private func isValidKingMove(from: ChessPosition, to: ChessPosition, piece: ChessPiece) -> Bool { if abs(from.row - to.row) <= 1 && abs(from.col - to.col) <= 1 { return true }; if !piece.hasMoved && abs(from.col - to.col) == 2 && from.row == to.row { return canCastle(kingSide: to.col > from.col) }; return false }
+    private func isValidPosition(_ pos: ChessPosition) -> Bool { return pos.row >= 0 && pos.row < 8 && pos.col >= 0 && pos.col < 8 }
+    private func isPathClear(from: ChessPosition, to: ChessPosition) -> Bool { guard from != to else { return true }; let rowStep = (to.row - from.row).signum(); let colStep = (to.col - from.col).signum(); var currentRow = from.row + rowStep; var currentCol = from.col + colStep; while currentRow != to.row || currentCol != to.col { if !isValidPosition(ChessPosition(row: currentRow, col: currentCol)) { return false }; if board[currentRow][currentCol] != nil { return false }; currentRow += rowStep; currentCol += colStep }; return true }
+    func isKingInCheck(color: ChessColor) -> Bool { guard let kingPos = (color == .white ? whiteKingPosition : blackKingPosition) else { return false }; return isSquareAttacked(pos: kingPos, by: color.opponent) }
+    func generateValidMoves() -> [ChessMove] { var validMoves: [ChessMove] = []; for r in 0..<8 { for c in 0..<8 { if let piece = board[r][c], piece.color == currentPlayer { let from = ChessPosition(row: r, col: c); for tr in 0..<8 { for tc in 0..<8 { let to = ChessPosition(row: tr, col: tc); if isValidMove(from: from, to: to) { let captured = board[tr][tc]; let isEP = piece.type == .pawn && to == enPassantTargetSquare; let isCastle = piece.type == .king && abs(c-tc) == 2; let promotionRank = (piece.color == .white) ? 0 : 7; let promotionType: ChessPieceType? = (piece.type == .pawn && tr == promotionRank) ? .queen : nil; validMoves.append(ChessMove(from: from, to: to, piece: piece, capturedPiece: captured, promotionType: promotionType, wasEnPassant: isEP, wasCastling: isCastle)) } } } } } }; return validMoves }
+    private func updateGameState() { isCheck = isKingInCheck(color: currentPlayer); let hasValidMoves = !generateValidMoves().isEmpty; if !hasValidMoves { isCheckmate = isCheck; isStalemate = !isCheck; if isCheckmate { winner = currentPlayer.opponent } } else { isCheckmate = false; isStalemate = false; winner = nil } }
+    private func canCastle(kingSide: Bool) -> Bool { guard !isCheck else { return false }; let row = currentPlayer == .white ? 7 : 0; let kingCol = 4; let rookCol = kingSide ? 7 : 0; let pathCols = kingSide ? [5, 6] : [1, 2, 3]; let crossingCol = kingSide ? 5 : 3; guard let king = board[row][kingCol], king.type == .king, !king.hasMoved else { return false }; guard let rook = board[row][rookCol], rook.type == .rook, !rook.hasMoved else { return false }; let canCastleThisSide = kingSide ? (currentPlayer == .white ? whiteCanCastleKingSide : blackCanCastleKingSide) : (currentPlayer == .white ? whiteCanCastleQueenSide : blackCanCastleQueenSide); guard canCastleThisSide else { return false }; for col in pathCols { if board[row][col] != nil { return false } }; if isSquareAttacked(pos: ChessPosition(row: row, col: crossingCol), by: currentPlayer.opponent) { return false }; return true }
+    func isSquareAttacked(pos: ChessPosition, by attackerColor: ChessColor) -> Bool { for r in 0..<8 { for c in 0..<8 { if let piece = board[r][c], piece.color == attackerColor { if isPseudoLegalMove(from: ChessPosition(row: r, col: c), to: pos, for: attackerColor) { return true } } } }; return false }
+    private func updateCastlingRights(movedPiece: ChessPiece, from: ChessPosition, capturedPiece: ChessPiece?, to: ChessPosition) { if movedPiece.type == .king { if movedPiece.color == .white { whiteCanCastleKingSide = false; whiteCanCastleQueenSide = false } else { blackCanCastleKingSide = false; blackCanCastleQueenSide = false } } else if movedPiece.type == .rook { if movedPiece.color == .white { if from.row == 7 && from.col == 0 { whiteCanCastleQueenSide = false }; if from.row == 7 && from.col == 7 { whiteCanCastleKingSide = false } } else { if from.row == 0 && from.col == 0 { blackCanCastleQueenSide = false }; if from.row == 0 && from.col == 7 { blackCanCastleKingSide = false } } }; if let captured = capturedPiece, captured.type == .rook { if captured.color == .white { if to.row == 7 && to.col == 0 { whiteCanCastleQueenSide = false }; if to.row == 7 && to.col == 7 { whiteCanCastleKingSide = false } } else { if to.row == 0 && to.col == 0 { blackCanCastleQueenSide = false }; if to.row == 0 && to.col == 7 { blackCanCastleKingSide = false } } } }
+    func makeMove(from: ChessPosition, to: ChessPosition) -> Bool { guard isValidMove(from: from, to: to) else { return false }; guard var piece = board[from.row][from.col] else { return false }; let capturedPiece = board[to.row][to.col]; var wasEnPassantCapture = false; var wasCastlingMove = false; var promotionType: ChessPieceType? = nil; var effectiveCapturedPiece = capturedPiece; if piece.type == .king && abs(from.col - to.col) == 2 { wasCastlingMove = true; let kingSide = to.col > from.col; let rookCol = kingSide ? 7 : 0; let rookDestCol = kingSide ? 5 : 3; let rookFromPos = ChessPosition(row: from.row, col: rookCol); let rookToPos = ChessPosition(row: from.row, col: rookDestCol); if var rook = board[rookFromPos.row][rookFromPos.col], rook.type == .rook { rook.hasMoved = true; board[rookToPos.row][rookToPos.col] = rook; board[rookFromPos.row][rookFromPos.col] = nil } else { return false } } else if piece.type == .pawn && to == enPassantTargetSquare { wasEnPassantCapture = true; let capturedPawnRow = currentPlayer == .white ? to.row + 1 : to.row - 1; let capturedPawnPos = ChessPosition(row: capturedPawnRow, col: to.col); effectiveCapturedPiece = board[capturedPawnPos.row][capturedPawnPos.col]; board[capturedPawnPos.row][capturedPawnPos.col] = nil }; let promotionRank = (piece.color == .white) ? 0 : 7; if piece.type == .pawn && to.row == promotionRank { promotionType = .queen; piece = ChessPiece(color: piece.color, type: promotionType!, hasMoved: true) }; updateCastlingRights(movedPiece: piece, from: from, capturedPiece: capturedPiece, to: to); piece.hasMoved = true; board[to.row][to.col] = piece; board[from.row][from.col] = nil; if piece.type == .king { if piece.color == .white { whiteKingPosition = to } else { blackKingPosition = to } }; let startRank = (piece.color == .white) ? 6 : 1; if piece.type == .pawn && abs(from.row - to.row) == 2 && from.row == startRank { enPassantTargetSquare = ChessPosition(row: (from.row + to.row) / 2, col: from.col) } else { enPassantTargetSquare = nil }; let move = ChessMove(from: from, to: to, piece: board[to.row][to.col]!, capturedPiece: effectiveCapturedPiece, promotionType: promotionType, wasEnPassant: wasEnPassantCapture, wasCastling: wasCastlingMove); moveHistory.append(move); currentPlayer = currentPlayer.opponent; updateGameState(); return true }
+    func undoLastMove() { guard let lastMove = moveHistory.popLast() else { return }; var pieceToRestore = lastMove.piece; if let _ = lastMove.promotionType { pieceToRestore = ChessPiece(color: lastMove.piece.color, type: .pawn) }; let firstMove = !moveHistory.contains { $0.from == lastMove.from || ($0.piece.type == pieceToRestore.type && $0.piece.color == pieceToRestore.color && $0.to == lastMove.from) }; pieceToRestore.hasMoved = !firstMove; board[lastMove.from.row][lastMove.from.col] = pieceToRestore; board[lastMove.to.row][lastMove.to.col] = nil; if lastMove.wasEnPassant { let capturedPawnRow = currentPlayer == .white ? lastMove.to.row + 1 : lastMove.to.row - 1; let capturedPawnPos = ChessPosition(row: capturedPawnRow, col: lastMove.to.col); board[capturedPawnPos.row][capturedPawnPos.col] = lastMove.capturedPiece } else { board[lastMove.to.row][lastMove.to.col] = lastMove.capturedPiece }; if lastMove.wasCastling { let kingSide = lastMove.to.col > lastMove.from.col; let rookDestCol = kingSide ? 5 : 3; let rookStartCol = kingSide ? 7 : 0; let rookCurrentPos = ChessPosition(row: lastMove.from.row, col: rookDestCol); let rookOriginalPos = ChessPosition(row: lastMove.from.row, col: rookStartCol); if var rook = board[rookCurrentPos.row][rookCurrentPos.col], rook.type == .rook { rook.hasMoved = false; board[rookOriginalPos.row][rookOriginalPos.col] = rook; board[rookCurrentPos.row][rookCurrentPos.col] = nil } }; currentPlayer = currentPlayer.opponent; if pieceToRestore.type == .king { if pieceToRestore.color == .white { whiteKingPosition = lastMove.from } else { blackKingPosition = lastMove.from } }; if let previousMove = moveHistory.last { let prevPiece = previousMove.piece; let prevStartRank = (prevPiece.color == .white) ? 6 : 1; if prevPiece.type == .pawn && abs(previousMove.from.row - previousMove.to.row) == 2 && previousMove.from.row == prevStartRank { enPassantTargetSquare = ChessPosition(row: (previousMove.from.row + previousMove.to.row) / 2, col: previousMove.from.col) } else { enPassantTargetSquare = nil } } else { enPassantTargetSquare = nil }; updateGameState() }
+    func getHint() -> ChessMove? { let validMoves = generateValidMoves(); return validMoves.randomElement() ?? validMoves.first }
+}
+// MODIFIED: DominoesViewModel conforms to CoinCountProvider
+class DominoesViewModel: ObservableObject, CoinCountProvider {
+    @Published var boardDominoes: [PlayedDomino] = []
+    @Published var player1Dominoes: [Domino] = []
+    @Published var player2Dominoes: [Domino] = []
+    @Published var selectedDomino: Domino? = nil
+    @Published var currentPlayer: PlayerType = .player1
+    @Published var gameStatusMessage: String = ""
+    @Published var player1Score: Int = 0
+    @Published var player2Score: Int = 0
+    @Published var isGameOver: Bool = false
+    @Published var roundWinner: PlayerType? = nil
+    @Published var hint: DominoHint? = nil
+    @Published var hintMessage: String? = nil
+    private var coinManager: CoinManager
+    private var drawPile: [Domino] = []
+    @Published var currentCoinCount: Int = 0 // Required by CoinCountProvider
+    private var cancellable: AnyCancellable?
+
+    var drawPileCount: Int { drawPile.count }
+    var isDrawPileEmpty: Bool { drawPile.isEmpty }
+    var leftEndValue: Int { guard let first = boardDominoes.first else { return -1 }; return first.isRotated ? first.domino.bottomValue : first.domino.topValue }
+    var rightEndValue: Int { guard let last = boardDominoes.last else { return -1 }; return last.isRotated ? last.domino.topValue : last.domino.bottomValue }
+
+    init(coinManager: CoinManager) {
+        self.coinManager = coinManager
+        self.currentCoinCount = coinManager.coins
+        self.cancellable = coinManager.$coins.sink { [weak self] newCount in
+            self?.currentCoinCount = newCount
+        }
+    }
+    // ... rest of DominoesViewModel methods unchanged ...
+    func startNewGame() { var allDominoes: [Domino] = []; for i in 0...6 { for j in i...6 { allDominoes.append(Domino(topValue: i, bottomValue: j)) } }; drawPile = allDominoes.shuffled(); player1Dominoes = Array(drawPile.prefix(7)); drawPile.removeFirst(7); player2Dominoes = Array(drawPile.prefix(7)); drawPile.removeFirst(7); boardDominoes = []; isGameOver = false; roundWinner = nil; currentPlayer = Bool.random() ? .player1 : .player2; selectedDomino = nil; hint = nil; hintMessage = nil; gameStatusMessage = "\(currentPlayer == .player1 ? "Your" : "AI's") turn"; if currentPlayer == .player2 && !isGameOver { makeAIMoveAfterDelay() } }
+    func selectDomino(_ domino: Domino) { guard currentPlayer == .player1, !isGameOver else { return }; selectedDomino = (selectedDomino?.id == domino.id) ? nil : domino; hint = nil; hintMessage = nil }
+    func playSelectedDominoOnLeft() { guard let selected = selectedDomino, !isGameOver else { return }; playDomino(selected, onEnd: .left) }
+    func playSelectedDominoOnRight() { guard let selected = selectedDomino, !isGameOver else { return }; playDomino(selected, onEnd: .right) }
+    func drawDomino() { guard currentPlayer == .player1, !drawPile.isEmpty, !isGameOver else { return }; hint = nil; hintMessage = nil; let drawnDomino = drawPile.removeFirst(); player1Dominoes.append(drawnDomino); selectedDomino = nil; if !canCurrentPlayerPlay() { if drawPile.isEmpty { checkForBlockedGame() }; if !isGameOver { gameStatusMessage = "You drew. Still cannot play. Passing turn."; switchTurn() } } else { gameStatusMessage = "You drew a domino. Play or draw again." } }
+    private func playDomino(_ domino: Domino, onEnd end: DominoEnd) { guard let index = (currentPlayer == .player1 ? player1Dominoes : player2Dominoes).firstIndex(where: { $0.id == domino.id }) else { return }; hint = nil; hintMessage = nil; let currentHand = (currentPlayer == .player1 ? player1Dominoes : player2Dominoes); let dominoToPlay = currentHand[index]; var isValidPlay = false; var needsRotation = false; if boardDominoes.isEmpty { isValidPlay = true } else { let targetValue = (end == .left) ? leftEndValue : rightEndValue; let val1 = dominoToPlay.topValue; let val2 = dominoToPlay.bottomValue; if end == .left { if val2 == targetValue { isValidPlay = true; needsRotation = false; } else if val1 == targetValue { isValidPlay = true; needsRotation = true; } } else { if val1 == targetValue { isValidPlay = true; needsRotation = false; } else if val2 == targetValue { isValidPlay = true; needsRotation = true; } } }; if isValidPlay { let playedDomino = PlayedDomino(domino: dominoToPlay, isRotated: needsRotation); if end == .left { boardDominoes.insert(playedDomino, at: 0) } else { boardDominoes.append(playedDomino) }; if currentPlayer == .player1 { player1Dominoes.remove(at: index); player1Score += calculatePoints(); if player1Dominoes.isEmpty { endRound(winner: .player1); return } } else { player2Dominoes.remove(at: index); player2Score += calculatePoints(); if player2Dominoes.isEmpty { endRound(winner: .player2); return } }; selectedDomino = nil; switchTurn() } else { if currentPlayer == .player1 { gameStatusMessage = "Invalid move."; selectedDomino = nil } else { print("AI Error: Invalid move.") } } }
+    private func switchTurn() { guard !isGameOver else { return }; currentPlayer = (currentPlayer == .player1) ? .player2 : .player1; selectedDomino = nil; hint = nil; hintMessage = nil; gameStatusMessage = "\(currentPlayer == .player1 ? "Your" : "AI's") turn"; if !canCurrentPlayerPlay() { if drawPile.isEmpty { checkForBlockedGame() } else { gameStatusMessage = "\(currentPlayer == .player1 ? "You" : "AI") cannot play. Must draw."; if currentPlayer == .player2 { makeAIMoveAfterDelay() } } } else { if currentPlayer == .player2 { makeAIMoveAfterDelay() } } }
+    private func canPlayDomino(_ domino: Domino, on boardLeft: Int, on boardRight: Int) -> Bool { if boardDominoes.isEmpty { return true }; return domino.topValue == boardLeft || domino.bottomValue == boardLeft || domino.topValue == boardRight || domino.bottomValue == boardRight }
+    private func canCurrentPlayerPlay() -> Bool { let hand = (currentPlayer == .player1) ? player1Dominoes : player2Dominoes; if boardDominoes.isEmpty { return !hand.isEmpty }; return hand.contains { canPlayDomino($0, on: leftEndValue, on: rightEndValue) } }
+    private func calculatePoints() -> Int { guard !boardDominoes.isEmpty else { return 0 }; let left = leftEndValue; let right = rightEndValue; let sum: Int; if boardDominoes.count == 1 { sum = boardDominoes.first!.domino.sum } else { sum = left + right }; return (sum > 0 && sum % 5 == 0) ? sum / 5 : 0 }
+    private func makeAIMoveAfterDelay() { guard !isGameOver else { return }; DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in self?.makeAIMove() } }
+    private func makeAIMove() { guard currentPlayer == .player2, !isGameOver else { return }; let playableMoves = findPlayableMovesForAI(); if !playableMoves.isEmpty { playDomino(playableMoves.first!.domino, onEnd: playableMoves.first!.end) } else if !drawPile.isEmpty { let drawnDomino = drawPile.removeFirst(); player2Dominoes.append(drawnDomino); gameStatusMessage = "AI drew a domino."; if canPlayDomino(drawnDomino, on: leftEndValue, on: rightEndValue) { makeAIMoveAfterDelay() } else { if drawPile.isEmpty { checkForBlockedGame() }; if !isGameOver { gameStatusMessage = "AI drew. Still cannot play. Passing turn."; switchTurn() } } } else { checkForBlockedGame() } }
+    private func findPlayableMoves(for hand: [Domino]) -> [(domino: Domino, end: DominoEnd)] { var moves: [(domino: Domino, end: DominoEnd)] = []; let currentLeft = leftEndValue; let currentRight = rightEndValue; if boardDominoes.isEmpty { if let firstMoveDomino = hand.max(by: { a, b in if a.isDouble != b.isDouble { return a.isDouble } else { return a.sum < b.sum } }) { moves.append((firstMoveDomino, .right)) }; return moves }; for domino in hand { var playedOnLeft = false; if domino.bottomValue == currentLeft || domino.topValue == currentLeft { moves.append((domino, .left)); playedOnLeft = true }; if domino.topValue == currentRight || domino.bottomValue == currentRight { if !playedOnLeft || currentLeft != currentRight { moves.append((domino, .right)) } } }; return moves }
+    private func findPlayableMovesForAI() -> [(domino: Domino, end: DominoEnd)] { return findPlayableMoves(for: player2Dominoes) }
+    private func checkForBlockedGame() { guard drawPile.isEmpty, !isGameOver else { return }; let p1Blocked = !player1Dominoes.contains { canPlayDomino($0, on: leftEndValue, on: rightEndValue) }; let p2Blocked = !player2Dominoes.contains { canPlayDomino($0, on: leftEndValue, on: rightEndValue) }; if p1Blocked && p2Blocked { isGameOver = true; let p1Pips = player1Dominoes.reduce(0) { $0 + $1.sum }; let p2Pips = player2Dominoes.reduce(0) { $0 + $1.sum }; let winner: PlayerType? = (p1Pips < p2Pips) ? .player1 : ((p2Pips < p1Pips) ? .player2 : nil); self.roundWinner = winner; gameStatusMessage = "Game blocked! \(winner == .player1 ? "You win" : (winner == .player2 ? "AI wins" : "It's a tie")) by points."; if winner == .player1 { coinManager.addCoin() } } }
+    private func endRound(winner: PlayerType) { guard !isGameOver else { return }; isGameOver = true; self.roundWinner = winner; let opponentPips: Int; let winnerName: String; if winner == .player1 { winnerName = "You"; opponentPips = player2Dominoes.reduce(0) { $0 + $1.sum }; player1Score += opponentPips; coinManager.addCoin() } else { winnerName = "AI"; opponentPips = player1Dominoes.reduce(0) { $0 + $1.sum }; player2Score += opponentPips }; gameStatusMessage = "\(winnerName) emptied hand! \(winnerName) wins round! +\(opponentPips) points" }
+    func requestHint() { guard currentPlayer == .player1, !isGameOver else { hint = nil; hintMessage = nil; return }; guard coinManager.coins > 0 else { hintMessage = "Not enough coins for a hint."; hint = nil; return }; let playableMoves = findPlayableMoves(for: player1Dominoes); if let move = playableMoves.randomElement() { if coinManager.spendCoin() { let endString = move.end == .left ? "left" : "right"; let hintMsg = "Hint: Try playing \(dominoDescription(move.domino)) on the \(endString)."; self.hint = DominoHint(dominoId: move.domino.id, endToPlay: move.end, message: hintMsg); self.hintMessage = hintMsg; self.selectedDomino = nil } else { hintMessage = "Could not spend coin."; hint = nil } } else { self.hint = nil; self.hintMessage = "No playable moves found for a hint."; if !drawPile.isEmpty { self.hintMessage = "No playable moves found. Try drawing." } } }
+    private func dominoDescription(_ domino: Domino) -> String { return "[\(domino.topValue)|\(domino.bottomValue)]" }
+}
+// MODIFIED: SnakesAndLaddersViewModel conforms to CoinCountProvider
+class SnakesAndLaddersViewModel: ObservableObject, CoinCountProvider {
+    @Published var playerPosition = 0; @Published var aiPosition = 0
+    @Published var diceValue = 0; @Published var gameStatusMessage = "Roll the dice to start!"
+    @Published var isPlayerTurn = true; @Published var canRollDice = true
+    @Published var winner: String? = nil
+    private var coinManager: CoinManager
+    @Published var currentCoinCount: Int = 0 // Required by CoinCountProvider
+    private var cancellable: AnyCancellable?
+    let snakes: [Snake] = [ Snake(start: 16, end: 6), Snake(start: 47, end: 26), Snake(start: 49, end: 11), Snake(start: 56, end: 53), Snake(start: 62, end: 19), Snake(start: 64, end: 60), Snake(start: 87, end: 24), Snake(start: 93, end: 73), Snake(start: 95, end: 75), Snake(start: 98, end: 78) ]
+    let ladders: [Ladder] = [ Ladder(start: 1, end: 38), Ladder(start: 4, end: 14), Ladder(start: 9, end: 31), Ladder(start: 21, end: 42), Ladder(start: 28, end: 84), Ladder(start: 36, end: 44), Ladder(start: 51, end: 67), Ladder(start: 71, end: 91), Ladder(start: 80, end: 100) ]
+    let finalSquare = 100
+
+    init(coinManager: CoinManager) {
+        self.coinManager = coinManager
+        self.currentCoinCount = coinManager.coins
+        self.cancellable = coinManager.$coins.sink { [weak self] newCount in
+            self?.currentCoinCount = newCount
+        }
+    }
+    // ... rest of SnakesAndLaddersViewModel methods unchanged ...
+    func setupGame() { playerPosition = 0; aiPosition = 0; diceValue = 0; isPlayerTurn = Bool.random(); canRollDice = true; winner = nil; gameStatusMessage = "\(isPlayerTurn ? "Your" : "AI's") turn to roll!"; if !isPlayerTurn { triggerAITurn() } }
+    func resetGame() { setupGame() }
+    func rollDice() { guard winner == nil else { return }; if isPlayerTurn && !canRollDice { return }; if isPlayerTurn { canRollDice = false }; diceValue = Int.random(in: 1...6); if isPlayerTurn { gameStatusMessage = "You rolled a \(diceValue)!"; movePlayer(steps: diceValue) } else { gameStatusMessage = "AI rolled a \(diceValue)!"; moveAI(steps: diceValue) } }
+    private func movePlayer(steps: Int) { animateMove(steps: steps, isPlayer: true) { [weak self] pos in self?.handleEndOfMove(finalPosition: pos, isPlayer: true) } }
+    private func moveAI(steps: Int) { animateMove(steps: steps, isPlayer: false) { [weak self] pos in self?.handleEndOfMove(finalPosition: pos, isPlayer: false) } }
+    private func handleEndOfMove(finalPosition: Int, isPlayer: Bool) { if finalPosition == finalSquare { winner = isPlayer ? "You" : "AI"; gameStatusMessage = "\(winner!) win! 🎉"; canRollDice = false; if winner == "You" { coinManager.addCoin() }; return }; DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in guard let self = self, self.winner == nil else { return }; let posAfterSlide = self.checkSnakesAndLadders(currentPosition: finalPosition, isPlayer: isPlayer); if posAfterSlide == self.finalSquare { self.winner = isPlayer ? "You" : "AI"; self.gameStatusMessage = "\(self.winner!) landed via \(posAfterSlide > finalPosition ? "ladder" : "snake")! \(self.winner!) win! 🎉"; self.canRollDice = false; if self.winner == "You" { self.coinManager.addCoin() }; return }; let delaySwitch = (posAfterSlide != finalPosition) ? 0.5 : 0.0; DispatchQueue.main.asyncAfter(deadline: .now() + delaySwitch) { [weak self] in self?.switchTurn() } } }
+    private func switchTurn() { guard winner == nil else { return }; isPlayerTurn.toggle(); gameStatusMessage = "\(isPlayerTurn ? "Your" : "AI's") turn to roll"; canRollDice = isPlayerTurn; if !isPlayerTurn { triggerAITurn() } }
+    private func triggerAITurn() { guard winner == nil else { return }; DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.rollDice() } }
+    private func animateMove(steps: Int, isPlayer: Bool, completion: @escaping (Int) -> Void) { var remainingSteps = steps; var currentPosition = isPlayer ? playerPosition : aiPosition; let stepInterval = 0.15; func scheduleNextStep() { DispatchQueue.main.asyncAfter(deadline: .now() + stepInterval) { step() } }; func step() { guard remainingSteps > 0 else { completion(currentPosition); return }; currentPosition += 1; if currentPosition >= finalSquare { currentPosition = finalSquare; remainingSteps = 0 }; if isPlayer { playerPosition = currentPosition } else { aiPosition = currentPosition }; remainingSteps -= 1; if remainingSteps > 0 { scheduleNextStep() } else { completion(currentPosition) } }; if currentPosition == 0 { guard steps > 0 else { completion(0); return }; currentPosition = 1; remainingSteps -= 1; DispatchQueue.main.async { [weak self] in if isPlayer { self?.playerPosition = 1 } else { self?.aiPosition = 1 }; if remainingSteps > 0 { scheduleNextStep() } else { completion(currentPosition) } } } else { scheduleNextStep() } }
+    private func checkSnakesAndLadders(currentPosition: Int, isPlayer: Bool) -> Int { var newPosition = currentPosition; let name = isPlayer ? "You" : "AI"; if let snake = snakes.first(where: { $0.start == currentPosition }) { gameStatusMessage = "\(name) landed on a snake! 🐍"; newPosition = snake.end } else if let ladder = ladders.first(where: { $0.start == currentPosition }) { gameStatusMessage = "\(name) found a ladder! 🪜"; newPosition = ladder.end }; if newPosition != currentPosition { if isPlayer { playerPosition = newPosition } else { aiPosition = newPosition } }; return newPosition }
+}
+// MODIFIED: ChessViewModel conforms to CoinCountProvider
+class ChessViewModel: ObservableObject, CoinCountProvider {
+    @Published private(set) var game = ChessGame(); @Published var selectedPosition: ChessPosition? = nil; @Published var gameStatusMessage: String? = nil; @Published var hintMessage: String? = nil
+    private var coinManager: CoinManager
+    @Published var currentCoinCount: Int = 0 // Required by CoinCountProvider
+    private var cancellable: AnyCancellable?
+    var currentPlayer: ChessColor { game.currentPlayer }; var isGameOver: Bool { game.isGameOver }
+
+    init(coinManager: CoinManager) {
+        self.coinManager = coinManager
+        self.currentCoinCount = coinManager.coins
+        self.cancellable = coinManager.$coins.sink { [weak self] newCount in
+            self?.currentCoinCount = newCount
+        }
+    }
+    // ... rest of ChessViewModel methods unchanged ...
+    func getPiece(at position: ChessPosition) -> ChessPiece? { game.board[position.row][position.col] }
+    func isSquareSelected(row: Int, col: Int) -> Bool { selectedPosition == ChessPosition(row: row, col: col) }
+    func isValidMoveDestination(row: Int, col: Int) -> Bool { guard let from = selectedPosition else { return false }; return game.isValidMove(from: from, to: ChessPosition(row: row, col: col)) }
+    func handleSquareTap(row: Int, col: Int) { let tappedPosition = ChessPosition(row: row, col: col); hintMessage = nil; if isGameOver { updateStatusMessage(); return }; if let selected = selectedPosition { if game.makeMove(from: selected, to: tappedPosition) { selectedPosition = nil; updateStatusMessage(); if game.isCheckmate && game.winner == .white { coinManager.addCoin() }; if game.currentPlayer == .black && !game.isGameOver { makeAIMoveAfterDelay() } } else { if let tappedPiece = getPiece(at: tappedPosition), tappedPiece.color == game.currentPlayer { selectedPosition = tappedPosition } else { selectedPosition = nil } } } else { if let piece = getPiece(at: tappedPosition), piece.color == game.currentPlayer { selectedPosition = tappedPosition } } }
+    func resetGame() { game = ChessGame(); selectedPosition = nil; hintMessage = nil; updateStatusMessage() }
+    func undoMove() { hintMessage = nil; if game.currentPlayer == .white && !game.moveHistory.isEmpty { game.undoLastMove(); if !game.moveHistory.isEmpty { game.undoLastMove() } } else if game.currentPlayer == .black && game.moveHistory.count >= 1 { game.undoLastMove() }; selectedPosition = nil; updateStatusMessage() }
+    func requestHint() { guard !isGameOver else { hintMessage = nil; return }; guard coinManager.coins > 0 else { hintMessage = "Not enough coins for a hint."; return }; if let hintMove = game.getHint() { if coinManager.spendCoin() { selectedPosition = hintMove.from; hintMessage = "Hint: \(hintDescription(for: hintMove))"; gameStatusMessage = nil } else { hintMessage = "Could not spend coin." } } else if !isGameOver { hintMessage = "No moves available?" } else { hintMessage = nil }; objectWillChange.send() }
+    private func updateStatusMessage() { if hintMessage != nil { return }; if game.isCheckmate { gameStatusMessage = "Checkmate! \(game.winner == .white ? "White" : "Black") wins!" } else if game.isStalemate { gameStatusMessage = "Stalemate! It's a draw." } else if game.isCheck { gameStatusMessage = "\(game.currentPlayer == .white ? "White" : "Black") is in Check!" } else { gameStatusMessage = nil } }
+    private func hintDescription(for move: ChessMove) -> String { let fileMap: [Character] = ["a", "b", "c", "d", "e", "f", "g", "h"]; return "\(fileMap[move.from.col])\(8 - move.from.row) to \(fileMap[move.to.col])\(8 - move.to.row)" }
+    private func makeAIMoveAfterDelay() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in guard let self = self, self.game.currentPlayer == .black, !self.isGameOver else { return }; if let aiMove = self.game.getHint() { _ = self.game.makeMove(from: aiMove.from, to: aiMove.to); if self.game.isCheckmate && self.game.winner == .black { /* AI wins */ }; self.updateStatusMessage() } } }
+}
+
+
+// MARK: - SHARED HELPER VIEWS
+
+// MODIFIED: GameHeaderView accepts a generic ViewModel conforming to CoinCountProvider
+struct GameHeaderView<VM: CoinCountProvider>: View {
+    let title: String
+    let primaryColor: Color
+    let onBack: () -> Void
+    let onReset: () -> Void
+    @ObservedObject var coinProvider: VM // Observe the passed ViewModel
+
+    var body: some View {
+        HStack {
+            Button(action: onBack) { Image(systemName: "arrow.left").font(.title2).padding(.leading) }
+            Spacer()
+            Text(title).font(.title).fontWeight(.bold)
+            Spacer()
+            // Display count from the observed ViewModel
+            HStack(spacing: 4) {
+                Image(systemName: "bitcoinsign.circle.fill").foregroundColor(.orange)
+                Text("\(coinProvider.currentCoinCount)") // Use coinProvider
+                    .font(.headline)
+                    .foregroundColor(primaryColor)
+            }
+            .padding(.trailing, 5)
+            Button(action: onReset) { Image(systemName: "arrow.counterclockwise").font(.title2).padding(.trailing) }
+        }
+        .foregroundColor(primaryColor)
+        .frame(height: 44)
+    }
+}
+
+struct GameStatusAreaView: View { /* ... Unchanged ... */
+    let gameStatus: String?; let hintMessage: String?; let turnText: String; let isGameOver: Bool; let isCheck: Bool
+    var body: some View { HStack { Text(turnText).font(.headline).padding(.leading).opacity(isGameOver ? 0.5 : 1.0); Spacer(); if let message = hintMessage ?? gameStatus { Text(message).font(.headline).foregroundColor(hintMessage != nil ? .purple : (isCheck ? .red : .blue)).lineLimit(1).minimumScaleFactor(0.7).padding(.trailing) } }.frame(height: 30) }
+}
+
+// GameActionButtonsView observes ViewModel (Unchanged from previous)
+struct GameActionButtonsView: View {
+    let accentColor: Color; let isUndoEnabled: Bool
+    @ObservedObject var viewModel: ChessViewModel // Observe ViewModel
+    let isHintAvailable: Bool; let onUndo: () -> Void; let onHint: () -> Void
+    var isHintEnabled: Bool { isHintAvailable && viewModel.currentCoinCount > 0 } // Use VM's count
+
+    var body: some View {
+        HStack(spacing: 20) {
+            Button(action: onUndo) { Label("Undo", systemImage: "arrow.uturn.backward").padding().frame(maxWidth: .infinity).background(!isUndoEnabled ? Color.gray : accentColor).foregroundColor(.white).cornerRadius(10) }.disabled(!isUndoEnabled)
+            Button(action: onHint) { Label(isHintEnabled ? "Hint (1 Coin)" : "Hint", systemImage: "lightbulb").padding().frame(maxWidth: .infinity).background(!isHintEnabled ? Color.gray : accentColor).foregroundColor(.white).cornerRadius(10) }
+            .disabled(!isHintEnabled)
+        }.padding()
+    }
+}
+
+// MARK: - CHESS GAME SUB-VIEWS (Unchanged)
+struct ChessBoardView: View { /* ... */
+    @ObservedObject var viewModel: ChessViewModel; let boardDarkColor: Color; let boardLightColor: Color; let highlightColor: Color; let moveIndicatorColor: Color; let checkColor: Color
+    var body: some View { GeometryReader { geometry in let boardSize = min(geometry.size.width, geometry.size.height); let squareSize = boardSize / 8.0; VStack(spacing: 0) { ForEach(0..<8, id: \.self) { row in HStack(spacing: 0) { ForEach(0..<8, id: \.self) { col in let position = ChessPosition(row: row, col: col); ChessSquare(piece: viewModel.getPiece(at: position), isSelected: viewModel.isSquareSelected(row: row, col: col), isValidMove: viewModel.isValidMoveDestination(row: row, col: col), isCheck: viewModel.game.isCheck && viewModel.getPiece(at: position)?.type == .king && viewModel.getPiece(at: position)?.color == viewModel.game.currentPlayer, squareColor: (row + col) % 2 == 0 ? boardLightColor : boardDarkColor, highlightColor: highlightColor, moveIndicatorColor: moveIndicatorColor, checkColor: checkColor, squareSize: squareSize, onTap: { viewModel.handleSquareTap(row: row, col: col) } ).frame(width: squareSize, height: squareSize) } } } }.frame(width: boardSize, height: boardSize).border(Color.black, width: 1).position(x: geometry.size.width / 2, y: geometry.size.height / 2) } }
+}
+struct ChessSquare: View { /* ... */
+    let piece: ChessPiece?; let isSelected: Bool; let isValidMove: Bool; let isCheck: Bool; let squareColor: Color; let highlightColor: Color; let moveIndicatorColor: Color; let checkColor: Color; let squareSize: CGFloat; let onTap: () -> Void
+    var body: some View { ZStack { squareColor; if isCheck { checkColor }; if isValidMove { if piece == nil { Circle().fill(moveIndicatorColor).frame(width: squareSize * 0.25, height: squareSize * 0.25) } else { Rectangle().stroke(moveIndicatorColor, lineWidth: squareSize * 0.08) } }; if let piece = piece { Text(pieceToUnicode(piece)).font(.system(size: squareSize * 0.7)).minimumScaleFactor(0.5).lineLimit(1) }; if isSelected { highlightColor.opacity(0.4) } }.contentShape(Rectangle()).onTapGesture(perform: onTap) }
+    func pieceToUnicode(_ piece: ChessPiece) -> String { switch piece.color { case .white: switch piece.type { case .pawn: return "♙"; case .rook: return "♖"; case .knight: return "♘"; case .bishop: return "♗"; case .queen: return "♕"; case .king: return "♔" }; case .black: switch piece.type { case .pawn: return "♟︎"; case .rook: return "♜︎"; case .knight: return "♞︎"; case .bishop: return "♝︎"; case .queen: return "♛︎"; case .king: return "♚︎" } } }
+}
+
+// MARK: - CHESS GAME MAIN VIEW (Pass ViewModel to Header)
+struct ChessGameView: View {
+    @StateObject private var viewModel: ChessViewModel
+    @Environment(\.presentationMode) var presentationMode
+    // Removed @EnvironmentObject coinManager as it's not directly used in body
+    let boardDarkColor = Color(red: 0.45, green: 0.53, blue: 0.70); let boardLightColor = Color(red: 0.92, green: 0.92, blue: 0.95); let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let highlightColor = Color.yellow; let moveIndicatorColor = Color.green.opacity(0.4); let checkColor = Color.red.opacity(0.6); let primaryColor = Color(red: 0.2, green: 0.2, blue: 0.3)
+    init(coinManager: CoinManager) { _viewModel = StateObject(wrappedValue: ChessViewModel(coinManager: coinManager)) }
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.95, green: 0.95, blue: 0.97).edgesIgnoringSafeArea(.all)
+            VStack(spacing: 10) {
+                // MODIFIED: Pass viewModel to header as the coinProvider
+                GameHeaderView(title: "Chess", primaryColor: primaryColor, onBack: { presentationMode.wrappedValue.dismiss() }, onReset: { viewModel.resetGame() }, coinProvider: viewModel)
+
+                GameStatusAreaView(gameStatus: viewModel.gameStatusMessage, hintMessage: viewModel.hintMessage, turnText: "\(viewModel.currentPlayer == .white ? "White" : "Black")'s turn", isGameOver: viewModel.isGameOver, isCheck: viewModel.game.isCheck)
+                ChessBoardView(viewModel: viewModel, boardDarkColor: boardDarkColor, boardLightColor: boardLightColor, highlightColor: highlightColor, moveIndicatorColor: moveIndicatorColor, checkColor: checkColor).padding(.horizontal)
+                Spacer()
+                GameActionButtonsView(accentColor: accentColor, isUndoEnabled: !viewModel.game.moveHistory.isEmpty, viewModel: viewModel, isHintAvailable: !viewModel.isGameOver, onUndo: { viewModel.undoMove() }, onHint: { viewModel.requestHint() })
+            }.disabled(viewModel.currentPlayer == .black && !viewModel.isGameOver)
+        }.navigationBarHidden(true)
+    }
+}
+
+// MARK: - DOMINOES GAME SUB-VIEWS (Unchanged except ControlsView)
+struct PlayerHandView: View { /* ... */
+     @ObservedObject var viewModel: DominoesViewModel; let selectionColor: Color; let hint: DominoHint?
+     var body: some View { ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: 5) { ForEach(viewModel.player1Dominoes) { domino in DominoView(domino: domino, size: 70, isRotated: false).overlay( ZStack { if hint?.dominoId == domino.id { RoundedRectangle(cornerRadius: 8).stroke(Color.purple, lineWidth: 4).opacity(0.8) }; if viewModel.currentPlayer == .player1 && viewModel.selectedDomino?.id == domino.id { RoundedRectangle(cornerRadius: 8).stroke(selectionColor, lineWidth: 3) } } ).onTapGesture { viewModel.selectDomino(domino) }.opacity(viewModel.currentPlayer == .player1 ? 1.0 : 0.6) } }.padding() }.frame(height: 100).background(Color.white.opacity(0.5)).cornerRadius(12).padding(.horizontal) }
+}
+struct PlayerStatusView: View { /* ... */
+    let isCurrentPlayer: Bool; let playerName: String; let dominoCount: Int; let score: Int
+    var body: some View { VStack(alignment: .center) { Text(playerName).font(.headline).fontWeight(isCurrentPlayer ? .bold : .regular).foregroundColor(isCurrentPlayer ? .blue : .gray); HStack { Image(systemName: "rectangle.stack.fill"); Text("\(dominoCount)") }.font(.subheadline); HStack { Image(systemName: "star.fill"); Text("\(score)") }.font(.subheadline) }.padding(8).background(isCurrentPlayer ? Color.yellow.opacity(0.3) : Color.clear).cornerRadius(8) }
+}
+struct DominoBoard: View { /* ... */
+    let dominoes: [PlayedDomino]; let leftValue: Int; let rightValue: Int; let hint: DominoHint?
+    func shouldHighlightEnd(_ end: DominoEnd) -> Bool { return hint?.endToPlay == end }
+    var body: some View { LazyHStack(spacing: -15) { if !dominoes.isEmpty && shouldHighlightEnd(.left) { HintTargetOverlay() }; ForEach(dominoes) { playedDomino in DominoView(domino: playedDomino.domino, size: 60, isRotated: playedDomino.isRotated).zIndex(Double(dominoes.firstIndex { $0.id == playedDomino.id } ?? 0)) }; if !dominoes.isEmpty && shouldHighlightEnd(.right) { HintTargetOverlay() } }.frame(minWidth: 200, alignment: .leading) }
+}
+struct HintTargetOverlay: View { /* ... */ var body: some View { Rectangle().fill(Color.purple.opacity(0.3)).frame(width: 30, height: 60).cornerRadius(5).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.purple, lineWidth: 2)).padding(.horizontal, -10) } }
+struct DominoView: View { /* ... */
+    let domino: Domino; let size: CGFloat; var isRotated: Bool
+    var body: some View { let firstValue = isRotated ? domino.bottomValue : domino.topValue; let secondValue = isRotated ? domino.topValue : domino.bottomValue; let cornerRadiusSize: CGFloat = size * 0.08; Group { if domino.isDouble { HStack(spacing: 1) { ZStack { Rectangle().fill(Color.white); DotsView(number: firstValue).padding(size * 0.025) }.frame(width: (size * 0.5) - 1); Rectangle().fill(Color.black).frame(width: 2); ZStack { Rectangle().fill(Color.white); DotsView(number: secondValue).padding(size * 0.025) }.frame(width: (size * 0.5) - 1) }.frame(width: size, height: size * 0.5) } else { VStack(spacing: 1) { ZStack { Rectangle().fill(Color.white); DotsView(number: firstValue).padding(size * 0.05) }.frame(height: (size / 2) - 1); Rectangle().fill(Color.black).frame(height: 2); ZStack { Rectangle().fill(Color.white); DotsView(number: secondValue).padding(size * 0.05) }.frame(height: (size / 2) - 1) }.frame(width: size * 0.5, height: size) } }.background(Color.black).cornerRadius(cornerRadiusSize).shadow(color: .gray.opacity(0.5), radius: 2, x: 1, y: 1) }
+}
+struct DotsView: View { /* ... */
+    let number: Int
+    private let positions: [Int: [CGPoint]] = [ 0: [], 1: [CGPoint(x: 0.5, y: 0.5)], 2: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.75, y: 0.75)], 3: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.75, y: 0.75)], 4: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.75, y: 0.25), CGPoint(x: 0.25, y: 0.75), CGPoint(x: 0.75, y: 0.75)], 5: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.75, y: 0.25), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.25, y: 0.75), CGPoint(x: 0.75, y: 0.75)], 6: [CGPoint(x: 0.25, y: 0.25), CGPoint(x: 0.75, y: 0.25), CGPoint(x: 0.25, y: 0.5), CGPoint(x: 0.75, y: 0.5), CGPoint(x: 0.25, y: 0.75), CGPoint(x: 0.75, y: 0.75)] ]
+    var body: some View { GeometryReader { geometry in let dotSize = min(geometry.size.width, geometry.size.height) * 0.2; ZStack { if let dotPositions = positions[number] { ForEach(0..<dotPositions.count, id: \.self) { index in Circle().fill(Color.black).frame(width: dotSize, height: dotSize).position(x: dotPositions[index].x * geometry.size.width, y: dotPositions[index].y * geometry.size.height) } } }.frame(width: geometry.size.width, height: geometry.size.height) } }
+}
+
+// DominoesControlsView observes ViewModel
+struct DominoesControlsView: View {
+    @ObservedObject var viewModel: DominoesViewModel
+    let accentColor: Color
+    var isHintEnabled: Bool { viewModel.currentCoinCount > 0 } // Use VM's count
+
+    var body: some View {
+        HStack(spacing: 15) {
+            if viewModel.currentPlayer == .player1 && !viewModel.isGameOver {
+                if viewModel.selectedDomino == nil {
+                    Button(action: { viewModel.drawDomino() }) { Text("Draw").padding().frame(maxWidth: .infinity).background(viewModel.isDrawPileEmpty ? Color.gray : accentColor).foregroundColor(.white).cornerRadius(10).font(.headline) }.disabled(viewModel.isDrawPileEmpty)
+                    Button(action: { viewModel.requestHint() }) { Label(isHintEnabled ? "Hint (1 Coin)" : "Hint", systemImage: "lightbulb").padding().frame(maxWidth: .infinity).background(isHintEnabled ? accentColor : Color.gray).foregroundColor(.white).cornerRadius(10).font(.headline) }
+                    .disabled(!isHintEnabled) // Uses isHintEnabled from VM's count
+                } else {
+                    Button(action: { viewModel.playSelectedDominoOnLeft() }) { HStack { Image(systemName: "arrow.left.to.line"); Text("Play Left") }.padding().frame(maxWidth: .infinity).background(accentColor).foregroundColor(.white).cornerRadius(10).font(.headline) }.disabled(viewModel.boardDominoes.isEmpty && viewModel.selectedDomino?.isDouble == false)
+                    Button(action: { viewModel.playSelectedDominoOnRight() }) { HStack { Text("Play Right"); Image(systemName: "arrow.right.to.line") }.padding().frame(maxWidth: .infinity).background(accentColor).foregroundColor(.white).cornerRadius(10).font(.headline) }
+                }
+            }
+        }.padding([.horizontal, .bottom]).frame(height: 60)
+    }
+}
+
+// MARK: - DOMINOES GAME MAIN VIEW (Pass ViewModel to Header)
+struct DominoesGameView: View {
+    @StateObject private var viewModel: DominoesViewModel
+    @Environment(\.presentationMode) var presentationMode
+    // Removed @EnvironmentObject coinManager as it's not directly used in body
+    let primaryColor = Color(red: 0.2, green: 0.2, blue: 0.3); let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let backgroundColor = Color(red: 0.95, green: 0.95, blue: 0.97); let selectionColor = Color.yellow
+    init(coinManager: CoinManager) { _viewModel = StateObject(wrappedValue: DominoesViewModel(coinManager: coinManager)) }
+    var body: some View { ZStack { backgroundColor.edgesIgnoringSafeArea(.all); VStack(spacing: 15) {
+        // MODIFIED: Pass viewModel to header as the coinProvider
+        GameHeaderView(title: "Dominoes", primaryColor: primaryColor, onBack: { presentationMode.wrappedValue.dismiss() }, onReset: { viewModel.startNewGame() }, coinProvider: viewModel);
+        HStack { PlayerStatusView(isCurrentPlayer: viewModel.currentPlayer == .player2, playerName: "AI", dominoCount: viewModel.player2Dominoes.count, score: viewModel.player2Score); Spacer(); Text("Draw Pile: \(viewModel.drawPileCount)").font(.caption).foregroundColor(primaryColor.opacity(0.7)).padding(.horizontal); Spacer(); PlayerStatusView(isCurrentPlayer: viewModel.currentPlayer == .player1, playerName: "You", dominoCount: viewModel.player1Dominoes.count, score: viewModel.player1Score) }.padding(.horizontal); ScrollViewReader { _ in ScrollView([.horizontal, .vertical], showsIndicators: true) { DominoBoard(dominoes: viewModel.boardDominoes, leftValue: viewModel.leftEndValue, rightValue: viewModel.rightEndValue, hint: viewModel.hint).padding().id("GameBoard") }.background(Color.white.opacity(0.5)).cornerRadius(12).padding(.horizontal).frame(minHeight: 100, maxHeight: 250) }; if let message = viewModel.hintMessage ?? (!viewModel.gameStatusMessage.isEmpty ? viewModel.gameStatusMessage : nil) { Text(message).font(.headline).foregroundColor(viewModel.hintMessage != nil ? .purple : primaryColor).padding(10).frame(maxWidth: .infinity).background(accentColor.opacity(0.2)).cornerRadius(8).padding(.horizontal).lineLimit(2).minimumScaleFactor(0.8) }; PlayerHandView(viewModel: viewModel, selectionColor: selectionColor, hint: viewModel.hint); DominoesControlsView(viewModel: viewModel, accentColor: accentColor); Spacer() }.disabled(viewModel.currentPlayer == .player2 && !viewModel.isGameOver) }.navigationBarHidden(true).onAppear { if viewModel.boardDominoes.isEmpty && viewModel.player1Dominoes.isEmpty { viewModel.startNewGame() } } }
+}
+
+// MARK: - SNAKES AND LADDERS SUB-VIEWS (Unchanged)
+struct SnakesLaddersStatusView: View { /* ... */
+     @ObservedObject var viewModel: SnakesAndLaddersViewModel; let accentColor: Color
+     var body: some View { VStack(spacing: 10) { Text(viewModel.gameStatusMessage).font(.headline).padding(10).frame(maxWidth: .infinity).background(accentColor.opacity(0.2)).cornerRadius(8).lineLimit(2).minimumScaleFactor(0.7); HStack(spacing: 20) { PlayerInfoView(playerName: "You", position: viewModel.playerPosition, isCurrentTurn: viewModel.isPlayerTurn, playerColor: .blue); Spacer(); PlayerInfoView(playerName: "AI", position: viewModel.aiPosition, isCurrentTurn: !viewModel.isPlayerTurn, playerColor: .red) } }.padding(.horizontal) }
+}
+struct SnakesLaddersControlsView: View { /* ... */
+    @ObservedObject var viewModel: SnakesAndLaddersViewModel; let accentColor: Color
+    var body: some View { HStack { if viewModel.diceValue > 0 { DiceView(value: viewModel.diceValue).frame(width: 50, height: 50).transition(.scale.combined(with: .opacity)) } else { Spacer().frame(width: 50, height: 50) }; Spacer(); Button(action: { viewModel.rollDice() }) { Text(viewModel.winner == nil ? "Roll Dice" : "Game Over").font(.headline).padding().frame(width: 180).background(viewModel.canRollDice && viewModel.winner == nil ? accentColor : Color.gray).foregroundColor(.white).cornerRadius(10) }.disabled(!viewModel.canRollDice || viewModel.winner != nil); Spacer(); Spacer().frame(width: 50, height: 50) }.padding().animation(.easeInOut, value: viewModel.diceValue) }
+}
+struct PlayerInfoView: View { /* ... */
+    let playerName: String; let position: Int; let isCurrentTurn: Bool; let playerColor: Color
+    var body: some View { VStack(alignment: .center) { Text(playerName).font(.headline).fontWeight(isCurrentTurn ? .bold : .regular).foregroundColor(isCurrentTurn ? .black : .gray); HStack { Circle().fill(playerColor).frame(width: 12, height: 12); Text("Pos: \(position > 0 ? String(position) : "-")").font(.subheadline) } }.padding(10).frame(minWidth: 100).background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.6)).overlay(RoundedRectangle(cornerRadius: 8).stroke(isCurrentTurn ? playerColor : Color.clear, lineWidth: 2))).animation(.easeInOut(duration: 0.3), value: isCurrentTurn) }
+}
+struct DiceView: View { /* ... */ let value: Int; var body: some View { ZStack { RoundedRectangle(cornerRadius: 8).fill(Color.white).shadow(color: .gray.opacity(0.4), radius: 3, x: 1, y: 2); DotsView(number: value).padding(5) } } }
+struct SnakesAndLaddersBoard: View { /* ... */
+    @ObservedObject var viewModel: SnakesAndLaddersViewModel; let boardSize: CGFloat; let lightSquareColor = Color(red: 0.85, green: 0.95, blue: 0.8); let darkSquareColor = Color(red: 0.6, green: 0.8, blue: 0.5); let snakeColor = Color.red.opacity(0.8); let ladderColor = Color.brown.opacity(0.8); var squareSize: CGFloat { boardSize / 10.0 }; var playerTokenSize: CGFloat { squareSize * 0.6 }; var aiTokenSize: CGFloat { squareSize * 0.55 }
+    var body: some View { ZStack { VStack(spacing: 0) { ForEach(0..<10) { row in HStack(spacing: 0) { ForEach(0..<10) { col in let cellNumber = getNumber(row: row, col: col); ZStack { Rectangle().fill((row + col) % 2 == 0 ? lightSquareColor : darkSquareColor).frame(width: squareSize, height: squareSize); Text("\(cellNumber)").font(.system(size: squareSize * 0.3)).fontWeight(.bold).foregroundColor(.black.opacity(0.6)) } } } } }.frame(width: boardSize, height: boardSize); Canvas { context, size in for snake in viewModel.snakes { let start = positionForCell(snake.start, size: size); let end = positionForCell(snake.end, size: size); var p = Path(); p.move(to: start); p.addQuadCurve(to: end, control: CGPoint(x: (start.x+end.x)/2 + squareSize*0.5, y: (start.y+end.y)/2)); context.stroke(p, with: .color(snakeColor), lineWidth: squareSize*0.15) }; for ladder in viewModel.ladders { let start = positionForCell(ladder.start, size: size); let end = positionForCell(ladder.end, size: size); let dx = end.x-start.x; let dy = end.y-start.y; let len = sqrt(dx*dx+dy*dy); guard len > 0 else {continue}; let dirX = dx/len; let dirY = dy/len; let perpX = -dirY; let perpY = dirX; let railOff = squareSize*0.15; let rungW = squareSize*0.08; var p = Path(); p.move(to: CGPoint(x: start.x-perpX*railOff, y: start.y-perpY*railOff)); p.addLine(to: CGPoint(x: end.x-perpX*railOff, y: end.y-perpY*railOff)); p.move(to: CGPoint(x: start.x+perpX*railOff, y: start.y+perpY*railOff)); p.addLine(to: CGPoint(x: end.x+perpX*railOff, y: end.y+perpY*railOff)); let numRungs = max(1, Int(len/(squareSize*0.4))); for i in 1...numRungs { let t = CGFloat(i)/CGFloat(numRungs+1); let rungX = start.x+dx*t; let rungY = start.y+dy*t; p.move(to: CGPoint(x: rungX-perpX*railOff, y: rungY-perpY*railOff)); p.addLine(to: CGPoint(x: rungX+perpX*railOff, y: rungY+perpY*railOff)) }; context.stroke(p, with: .color(ladderColor), lineWidth: rungW) } }.frame(width: boardSize, height: boardSize); if viewModel.playerPosition > 0 { Circle().fill(.blue).overlay(Circle().stroke(.black, lineWidth: 1)).frame(width: playerTokenSize, height: playerTokenSize).position(positionForCell(viewModel.playerPosition, size: CGSize(width: boardSize, height: boardSize))).offset(x: -squareSize*0.05, y: -squareSize*0.05).animation(.easeInOut(duration: 0.15), value: viewModel.playerPosition).transition(.scale).zIndex(1) }; if viewModel.aiPosition > 0 { Circle().fill(.red).overlay(Circle().stroke(.black, lineWidth: 1)).frame(width: aiTokenSize, height: aiTokenSize).position(positionForCell(viewModel.aiPosition, size: CGSize(width: boardSize, height: boardSize))).offset(x: squareSize*0.05, y: squareSize*0.05).animation(.easeInOut(duration: 0.15), value: viewModel.aiPosition).transition(.scale).zIndex(0) } } }
+    private func getNumber(row: Int, col: Int) -> Int { let revRow = 9-row; return revRow%2==0 ? revRow*10+col+1 : revRow*10+(9-col)+1 }
+    private func positionForCell(_ cell: Int, size: CGSize) -> CGPoint { guard cell >= 1 && cell <= 100 else { return CGPoint(x: -size.width, y: -size.height) }; let sqSize = size.width/10.0; let zeroCell = cell-1; let rowFromBot = zeroCell/10; let row = 9-rowFromBot; let col = rowFromBot%2==0 ? zeroCell%10 : 9-(zeroCell%10); return CGPoint(x: (CGFloat(col)+0.5)*sqSize, y: (CGFloat(row)+0.5)*sqSize) }
+}
+
+// MARK: - SNAKES AND LADDERS MAIN VIEW (Pass ViewModel to Header)
+struct SnakesAndLaddersView: View {
+    @StateObject private var viewModel: SnakesAndLaddersViewModel
+    @Environment(\.presentationMode) var presentationMode
+    // Removed @EnvironmentObject coinManager
+    let primaryColor = Color(red: 0.2, green: 0.2, blue: 0.3); let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let backgroundColor = Color(red: 0.95, green: 0.95, blue: 0.97)
+    init(coinManager: CoinManager) { _viewModel = StateObject(wrappedValue: SnakesAndLaddersViewModel(coinManager: coinManager)) }
+    var body: some View { ZStack { backgroundColor.edgesIgnoringSafeArea(.all); VStack {
+        // MODIFIED: Pass viewModel to header as the coinProvider
+        GameHeaderView(title: "Snakes & Ladders", primaryColor: primaryColor, onBack: { presentationMode.wrappedValue.dismiss() }, onReset: { viewModel.resetGame() }, coinProvider: viewModel);
+        GeometryReader { geo in SnakesAndLaddersBoard(viewModel: viewModel, boardSize: geo.size.width) }.aspectRatio(1, contentMode: .fit).padding(); SnakesLaddersStatusView(viewModel: viewModel, accentColor: accentColor); Spacer(); SnakesLaddersControlsView(viewModel: viewModel, accentColor: accentColor) }.disabled(!viewModel.isPlayerTurn && viewModel.winner == nil) }.navigationBarHidden(true).onAppear { if viewModel.playerPosition == 0 && viewModel.aiPosition == 0 && viewModel.winner == nil { viewModel.setupGame() } } }
+}
+
+// MARK: - MAIN MENU & OTHER SCREENS (Unchanged)
+
+struct MainMenuView: View { /* ... */
+    @StateObject private var coinManager = CoinManager()
+    let primaryColor = Color(red: 0.2, green: 0.2, blue: 0.3); let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let backgroundColor = Color(red: 0.95, green: 0.95, blue: 0.97); @State private var showSettingsSheet = false; @State private var showAboutSheet = false
+    var body: some View { NavigationView { ZStack { backgroundColor.edgesIgnoringSafeArea(.all); VStack(spacing: 30) { VStack { Image(systemName: "gamecontroller.fill").font(.system(size: 60)).foregroundColor(accentColor).padding(.bottom, 5); Text("Classic Board Games").font(.largeTitle).fontWeight(.bold).foregroundColor(primaryColor) }.padding(.top, 50); VStack(spacing: 15) { NavigationLink { ChessGameView(coinManager: coinManager) } label: { GameButtonContent(title: "Chess", icon: "crown.fill", description: "The classic game of strategy", color: primaryColor) }.buttonStyle(PlainButtonStyle()); NavigationLink { DominoesGameView(coinManager: coinManager) } label: { GameButtonContent(title: "Dominoes", icon: "rectangle.stack.fill", description: "Match numbers and score points", color: primaryColor) }.buttonStyle(PlainButtonStyle()); NavigationLink { SnakesAndLaddersView(coinManager: coinManager) } label: { GameButtonContent(title: "Snakes & Ladders", icon: "arrow.up.and.down.circle.fill", description: "Race to the finish with luck", color: primaryColor) }.buttonStyle(PlainButtonStyle()) }.padding(.horizontal); Spacer(); HStack { Button { showAboutSheet = true } label: { Image(systemName: "info.circle").font(.title2).foregroundColor(primaryColor) }; Spacer(); Button { showSettingsSheet = true } label: { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(primaryColor) } }.padding(.horizontal, 30).padding(.bottom, 20) }.padding(.vertical) }.navigationBarHidden(true).environmentObject(coinManager).sheet(isPresented: $showSettingsSheet) { SettingsView() }.sheet(isPresented: $showAboutSheet) { AboutView() } }.navigationViewStyle(StackNavigationViewStyle()) }
+}
+struct GameButtonContent: View { /* ... */
+    let title: String; let icon: String; let description: String; let color: Color
+    var body: some View { HStack { Image(systemName: icon).font(.title2).foregroundColor(.white).frame(width: 50); VStack(alignment: .leading) { Text(title).font(.title3).fontWeight(.semibold); Text(description).font(.caption).opacity(0.8) }.foregroundColor(.white); Spacer(); Image(systemName: "chevron.right").foregroundColor(.white.opacity(0.7)) }.padding().background(color).cornerRadius(12) }
+}
+struct AboutView: View { /* ... */
+    let primaryColor = Color(red: 0.2, green: 0.2, blue: 0.3); let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let backgroundColor = Color(red: 0.95, green: 0.95, blue: 0.97); @Environment(\.presentationMode) var presentationMode
+    var body: some View { ZStack { backgroundColor.edgesIgnoringSafeArea(.all); VStack(spacing: 20) { HStack { Spacer(); Button("Done") { presentationMode.wrappedValue.dismiss() }.padding() }.foregroundColor(accentColor); Spacer(); Image(systemName: "gamecontroller.fill").font(.system(size: 80)).foregroundColor(accentColor).padding(.bottom, 20); Text("Classic Board Games").font(.title2).fontWeight(.bold).foregroundColor(primaryColor); Text("Version 1.0").font(.subheadline).foregroundColor(primaryColor.opacity(0.7)).padding(.bottom, 20); VStack(alignment: .leading, spacing: 15) { InfoRow(icon: "crown.fill", title: "Chess", description: "The classic game of strategy and tactics"); InfoRow(icon: "rectangle.stack.fill", title: "Dominoes", description: "Match tiles and score points"); InfoRow(icon: "arrow.up.and.down.circle.fill", title: "Snakes & Ladders", description: "Navigate the ups and downs") }.padding().background(Color.white.opacity(0.5)).cornerRadius(12).padding(.horizontal); Spacer(); Text("© \(Calendar.current.component(.year, from: Date())) Your Name/Company").font(.caption).foregroundColor(primaryColor.opacity(0.6)).padding(.bottom, 20) }.padding(.vertical) } }
+}
+struct InfoRow: View { /* ... */
+    let icon: String; let title: String; let description: String
+    var body: some View { HStack(spacing: 15) { Image(systemName: icon).font(.title3).foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.3)).frame(width: 30, alignment: .center); VStack(alignment: .leading, spacing: 2) { Text(title).font(.headline); Text(description).font(.caption).foregroundColor(.gray).fixedSize(horizontal: false, vertical: true) }; Spacer() } }
+}
+// MODIFIED: SettingsView removes Reset Coins button
+struct SettingsView: View {
+    @EnvironmentObject var coinManager: CoinManager
+    let accentColor = Color(red: 0.8, green: 0.7, blue: 0.5); let backgroundColor = Color(red: 0.95, green: 0.95, blue: 0.97)
+    @Environment(\.presentationMode) var presentationMode
+    @AppStorage("soundEnabled") private var soundEnabled = true; @AppStorage("hapticEnabled") private var hapticEnabled = true
+    @AppStorage("difficultyLevel") private var difficultyLevel = 1
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                backgroundColor.edgesIgnoringSafeArea(.all)
+                VStack(spacing: 20) {
+                    GroupBox { VStack(spacing: 0) {
+                        SettingRow(icon: "speaker.wave.3.fill", title: "Sound Effects", hasToggle: true, isOn: $soundEnabled);
+                        Divider().padding(.leading, 56);
+                        SettingRow(icon: "iphone.radiowaves.left.and.right", title: "Haptic Feedback", hasToggle: true, isOn: $hapticEnabled)
+                    } }.padding(.horizontal)
+
+                    GroupBox("AI Difficulty") { SettingRow(icon: "chart.bar.xaxis", title: "", hasToggle: false) {
+                        Picker("AI Difficulty", selection: $difficultyLevel) { Text("Easy").tag(0); Text("Medium").tag(1); Text("Hard").tag(2) }.pickerStyle(.segmented)
+                    } }.padding(.horizontal)
+
+                    // Removed Game Data GroupBox
+                    Spacer()
+                }.padding(.top, 20)
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { presentationMode.wrappedValue.dismiss() }.foregroundColor(accentColor) } }
+        }
+    }
+}
+struct SettingRow<Content: View>: View { /* ... */
+    let icon: String; let title: String; let hasToggle: Bool; var isOn: Binding<Bool>?; var content: (() -> Content)?
+    init(icon: String, title: String, hasToggle: Bool, isOn: Binding<Bool>) where Content == EmptyView { self.icon = icon; self.title = title; self.hasToggle = hasToggle; self.isOn = isOn; self.content = nil }
+    init(icon: String, title: String, hasToggle: Bool, @ViewBuilder content: @escaping () -> Content) { self.icon = icon; self.title = title; self.hasToggle = hasToggle; self.isOn = nil; self.content = content }
+    var body: some View { HStack(spacing: 15) { Image(systemName: icon).font(.headline).foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.3)).frame(width: 30, alignment: .center).padding(.leading, 5); if !title.isEmpty { Text(title).font(.body) }; Spacer(); if hasToggle, let isOn = isOn { Toggle("", isOn: isOn).labelsHidden().padding(.trailing, 5) } else if let content = content { content().padding(.trailing, 5) } }.padding(.vertical, 10) }
+}
+
+// MARK: - Main App Structure
+@main
+struct TripleBoardGameApp: App {
+    @StateObject private var coinManager = CoinManager()
+    var body: some Scene {
+        WindowGroup {
+            MainMenuView()
+                .environmentObject(coinManager)
+        }
+    }
+}
